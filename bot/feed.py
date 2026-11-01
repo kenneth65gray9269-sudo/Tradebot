@@ -161,7 +161,9 @@ class PrivateFeed(_BaseFeed):
             await ws.send(json.dumps({"op": "pong", "ts": msg.get("ts")}))
             return True
         if op == "auth":
-            if str(msg.get("err-code", 0)) in ("0", "None", ""):
+            code = msg.get("err-code", 0)
+            # Missing err-code means success. JSON null does not: str(None) == "None".
+            if code is not None and str(code) in ("0", ""):
                 self.authenticated.set()
                 log.info("private feed authenticated: %s", msg.get("data"))
                 await self._send_topic_subs(ws)
