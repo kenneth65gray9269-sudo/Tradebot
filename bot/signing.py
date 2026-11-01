@@ -75,16 +75,21 @@ def sign_ed25519(pre_signed: str, private_key_pem_or_b64: str) -> str:
         if not isinstance(key, Ed25519PrivateKey):
             raise ValueError("The PEM key is not an Ed25519 private key.")
     else:
-        raw = None
-        try:
-            raw = base64.b64decode(text, validate=True)
-        except Exception:
+        compact = "".join(text.split())
+        # A 32-byte seed in hex is 64 hex digits. Try that before base64: those
+        # digits are also valid base64 and would decode to the wrong 48 bytes.
+        if len(compact) == 64 and all(c in "0123456789abcdefABCDEF" for c in compact):
+            raw = bytes.fromhex(compact)
+        else:
             try:
-                raw = bytes.fromhex(text)
-            except Exception as exc:
-                raise ValueError("SUNX_SECRET_KEY is not a PEM, base64 or hex Ed25519 key.") from exc
-        if len(raw) == 48:          # DER-wrapped PKCS#8 seed
-            raw = raw[-32:]
+                raw = base64.b64decode(text, validate=True)
+            except Exception:
+                try:
+                    raw = bytes.fromhex(compact)
+                except Exception as exc:
+                    raise ValueError("SUNX_SECRET_KEY is not a PEM, base64 or hex Ed25519 key.") from exc
+            if len(raw) == 48:          # DER-wrapped PKCS#8 seed
+                raw = raw[-32:]
         if len(raw) != 32:
             raise ValueError(f"Ed25519 seed must be 32 bytes, got {len(raw)}.")
         key = Ed25519PrivateKey.from_private_bytes(raw)

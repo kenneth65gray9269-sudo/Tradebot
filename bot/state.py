@@ -36,10 +36,33 @@ class Position:
     leverage: float = 0.0
     unrealized: float = 0.0
     opened_at: float = 0.0
+    direction: str = ""          # "buy" long, "sell" short; used when position_side is "both"
 
     @property
     def is_open(self) -> bool:
         return self.volume > 0
+
+    @property
+    def is_long(self) -> bool:
+        """True for a long. One-way mode reports position_side 'both' plus direction."""
+        side = (self.position_side or "").lower()
+        direction = (self.direction or "").lower()
+        if side == "long":
+            return True
+        if side == "short":
+            return False
+        if direction == "sell":
+            return False
+        return True
+
+
+def _first_float(*values) -> float:
+    """First value that was actually sent. Zero is kept; missing keys are skipped."""
+    for value in values:
+        if value is None or value == "":
+            continue
+        return float(value)
+    return 0.0
 
 
 class State:
@@ -89,8 +112,10 @@ class State:
                 self.position = Position(
                     contract_code=self.contract_code,
                     position_side=p.get("position_side") or "",
+                    direction=str(p.get("direction") or ""),
                     volume=vol,
-                    entry_price=float(p.get("cost_open") or p.get("entry_price") or 0),
+                    entry_price=_first_float(p.get("open_avg_price"), p.get("cost_open"),
+                                             p.get("entry_price")),
                     leverage=float(p.get("lever_rate") or 0),
                     unrealized=float(p.get("profit_unreal") or 0),
                     opened_at=self.position.opened_at if was_open and vol > 0 else time.time(),

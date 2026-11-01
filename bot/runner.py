@@ -27,6 +27,36 @@ from .strategies import load as load_strategy
 log = logging.getLogger("bot")
 
 
+def _fee_value(payload: dict, *keys: str) -> float | None:
+    """First present fee. An explicit zero is a real fee, not a missing one."""
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None or value == "":
+            continue
+        return float(value)
+    return None
+
+
+def _one_way_fee(payload: dict, explicit: tuple[str, ...], open_key: str, close_key: str) -> float | None:
+    """One-way fee. The live API sends open_* and close_* instead of taker_fee_rate.
+
+    The rest of the bot multiplies this by two for a round trip, so differing
+    open and close rates are stored as their average.
+    """
+    found = _fee_value(payload, *explicit)
+    if found is not None:
+        return found
+    opened = _fee_value(payload, open_key)
+    closed = _fee_value(payload, close_key)
+    if opened is None:
+        return closed
+    if closed is None:
+        return opened
+    return (opened + closed) / 2
+
+
 def setup_logging(log_dir: str) -> None:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -102,12 +132,14 @@ class Bot:
         if self.cfg.access_key and self.cfg.secret_key:
             try:
                 fr = await self.rest.fee_rate(self.cfg.contract_code)
-                self.state.fee_taker = float(fr.get("taker_fee_rate") or fr.get("taker") or 0) or None
-                self.state.fee_maker = float(fr.get("maker_fee_rate") or fr.get("maker") or 0) or None
+                self.state.fee_taker = _one_way_fee(fr, ("taker_fee_rate", "taker"),
+                                                       "open_taker_fee", "close_taker_fee")
+                self.state.fee_maker = _one_way_fee(fr, ("maker_fee_rate", "maker"),
+                                                       "open_maker_fee", "close_maker_fee")
                 report["fee_taker"] = self.state.fee_taker
                 report["fee_maker"] = self.state.fee_maker
                 thr = self.risk.fee_threshold_pct()
-                if thr:
+                if thr is not None:
                     report["min_profitable_move_pct"] = round(thr, 4)
             except RestError as exc:
                 problems.append(f"Could not read the fee rate: {exc}")
@@ -125,27 +157,30 @@ class Bot:
         return report
 
     # ---------- main loop ----------
+    async def _step(self) -> None:
+        if not self.cfg.paper and not self.deadman.armed and self.state.position.is_open:
+            self.risk.halt("the dead man's switch is not armed while a position is open")
+        reason = self.risk.exit_reason()
+        if reason:
+            log.info("closing position: %s", reason)
+            await self.exec.close_all(note=reason)
+            return
+        if self.risk.halted:
+            return
+        intent = self.strategy.on_tick()
+        if intent.action in ("buy", "sell"):
+            await self.exec.submit(intent.action, intent.volume, intent.order_type,
+                                   intent.price, note=intent.reason)
+        elif intent.action == "close":
+            await self.exec.close_all(note=intent.reason)
+
     async def _trade_loop(self) -> None:
         await asyncio.wait_for(self.market.connected.wait(), timeout=60)
         log.info("strategy=%s mode=%s contract=%s", self.strategy.name,
                  "paper" if self.cfg.paper else "LIVE", self.cfg.contract_code)
         while not self._stop.is_set():
             await asyncio.sleep(1.0)
-            if not self.cfg.paper and not self.deadman.armed and self.state.position.is_open:
-                self.risk.halt("the dead man's switch is not armed while a position is open")
-            reason = self.risk.exit_reason()
-            if reason:
-                log.info("closing position: %s", reason)
-                await self.exec.close_all(note=reason)
-                continue
-            if self.risk.halted:
-                continue
-            intent = self.strategy.on_tick()
-            if intent.action in ("buy", "sell"):
-                await self.exec.submit(intent.action, intent.volume, intent.order_type,
-                                       intent.price, note=intent.reason)
-            elif intent.action == "close":
-                await self.exec.close_all(note=intent.reason)
+            await self._step()
 
     async def _status_loop(self, every: float = 30.0) -> None:
         path = Path(self.cfg.log_dir) / "status.json"
@@ -175,6 +210,7 @@ class Bot:
         log.info("preflight:\n%s", json.dumps(report, ensure_ascii=False, indent=2))
         if not report["ready"]:
             log.error("preflight failed; not trading. Fix the problems above.")
+            await self.rest.aclose()
             return 1
 
         tasks = [asyncio.create_task(self.market.run(), name="market"),
